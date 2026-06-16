@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+
+# Copyright 2023 Hewlett Packard Enterprise Development LP
+
+import sys
+import time
+import argparse
+import subprocess
+from pathlib import Path
+
+rf_user = None
+rf_pass = None
+switches = []
+RESULTS_DIR = './loopback_results'
+TIMEOUT = 300  # timeout in seconds
+TIMEOUT_INC = 30
+
+
+def parse_args():
+    global rf_user
+    global rf_pass
+
+    parser = argparse.ArgumentParser(
+        description='Cabinet SerDes Loopback Test')
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        '-c', '--cabinet',
+        help='Cabinet x-name to test, e.g. x9000')
+
+    group.add_argument(
+        '-s', '--switches', nargs='*',
+        help='Switch x-names to test, e.g. x9000c1r1b0')
+
+    parser.add_argument(
+        "--credentials",
+        help=("""Redfish credentials supplied as username:password. """
+              """Only required if using the --cabinet option"""))
+
+#    parser.add_argument(
+#        '-E', '--examax-only', action='store_true',
+#        help='Only test Colorado Examax connectors')
+
+    args = parser.parse_args()
+
+    if args.cabinet and not args.credentials:
+        print('--cabinet requires --credentials')
+        sys.exit(1)
+
+    if args.credentials:
+        if len(args.credentials.split(':')) != 2:
+            print('Credentials must be in format "username:password"')
+            sys.exit(1)
+        else:
+            rf_user = args.credentials.split(':')[0]
+            rf_pass = args.credentials.split(':')[1]
+
+    return args
+
+
+def get_cabinet_switches(args):
+    print('Searching {} for installed switches...'.format(args.cabinet))
+
+    switches = []
+    for c in range(8):
+        for p in range(8):
+            chassis = "{}c{}".format(args.cabinet, c)
+            cmd = '''ssh {} "curl -s -u {}:{} -k https://{}/redfish/v1/Chassis/Perif{} | jq '.Status.State'"'''.format(
+                  chassis, rf_user, rf_pass, chassis, p)
+            result = subprocess.run(cmd, shell=True, universal_newlines=True,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT)
+
+            # If ssh fails, that chassis isn't configured
+            if result.returncode:
+                break
+
+            if 'Enabled' in result.stdout:
+                switches.append("{}r{}b0".format(chassis, p))
+
+    return switches
+
+
+def main(args):
+    if args.switches:
+        switches = args.switches
+    else:
+        switches = get_cabinet_switches(args)
+
+    num_switches = len(switches)
+    if num_switches == 0:
+        print("No switches to test. Exiting.")
+        sys.exit(1)
+
+    pdsh_switches = ','.join(switches)
+    print('Testing switches {}'.format(pdsh_switches))
+
+    print("Cleaning up old logs...")
+    cmd = 'pdsh -R ssh -l root -w {} "if [[ -e /tmp/loopback.log ]]; then rm /tmp/loopback.log; fi &"'.format(pdsh_switches)
+    result = subprocess.run(cmd, shell=True, universal_newlines=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    print("Starting loopback test...")
+    #if args.examax_only:
+    #    examax_opt = '-E -f'
+    #else:
+    #    examax_opt = '-e -f'
+
+    cmd = 'pdsh -R ssh -l root -w {} "nohup dgrloopback_mfg.py </dev/null >/tmp/loopback.log 2>&1 &"'.format(pdsh_switches)
+    result = subprocess.run(cmd, shell=True, universal_newlines=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    print("Waiting for loopback test to finish...")
+    cmd = 'pdsh -R ssh -l root -w {} "grep SUMMARY /tmp/loopback.log || true"'.format(pdsh_switches)
+    count = 0
+    while count < TIMEOUT:
+        time.sleep(TIMEOUT_INC)
+        count += TIMEOUT_INC
+        print('  Waited {} seconds...'.format(count))
+        result = subprocess.run(cmd, shell=True, universal_newlines=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+
+        num_finished = result.stdout.count('SUMMARY')
+        if num_finished == num_switches:
+            break
+
+    if count >= TIMEOUT:
+        print('ERROR! Only {} of {} switches completed'.format(
+              num_finished, num_switches))
+    else:
+        print('{} of {} switches completed'.format(
+              num_finished, num_switches))
+
+    print("Getting results...")
+    if Path(RESULTS_DIR).exists():
+        for fn in Path(RESULTS_DIR).glob("*.log"):
+            fn.unlink()
+    else:
+        Path('./loopback_results').mkdir()
+
+    for sw in switches:
+        cmd = 'scp {}:/tmp/loopback.log {}/{}.log'.format(sw, RESULTS_DIR, sw)
+        result = subprocess.run(cmd, shell=True, universal_newlines=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+
+    print("SUMMARY (full results in {}):".format(RESULTS_DIR))
+    for fn in Path(RESULTS_DIR).glob("*.log"):
+        try:
+            sw = str(fn).split('/')[1].split('.')[0]
+        except Exception:
+            print("Invalid results file {}".format(fn))
+            continue
+
+        print("  {}:".format(sw))
+        with open(fn) as f:
+            for line in f:
+                if 'Num passing lanes' in line or 'Num failing lanes' in line:
+                    print('  {}'.format(line), end='')
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    main(args)
