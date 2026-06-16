@@ -89,10 +89,11 @@ def parse_cfirmware_output():
             if current_switch:
                 if "BMC" in line:
                     if "Absent" in line:
-                    parsed_data[current_switch]['Firmware version'] = 'Absent'
-                    version_number = line.split()[-1]
-                    cleaned = clean_up_string(version_number)
-                    parsed_data[current_switch]['Firmware version'] = cleaned if cleaned else version_number
+                        parsed_data[current_switch]['Firmware version'] = 'Absent'
+                    else:
+                        version_number = line.split()[-1]
+                        cleaned = clean_up_string(version_number)
+                        parsed_data[current_switch]['Firmware version'] = cleaned if cleaned else version_number
 
                 elif "Bootloader" in line:
                     if "secure" in line:
