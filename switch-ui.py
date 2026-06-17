@@ -206,7 +206,7 @@ def main(stdscr):
 
         
         # add tabs at the top
-        max_tabs = len(switch_locations)  # this math works because of the 'SUMMARY' tab, remember to adjust if changing that
+        max_tabs = len(switch_locations)
         tabs = ["SUMMARY"]
 
         for location in switch_locations[:12]:
