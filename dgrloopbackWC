@@ -101,10 +101,6 @@ def main(args):
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     print("Starting loopback test...")
-    #if args.examax_only:
-    #    examax_opt = '-E -f'
-    #else:
-    #    examax_opt = '-e -f'
 
     cmd = 'pdsh -R ssh -l root -w {} "nohup dgrloopback_mfg.py </dev/null >/tmp/loopback.log 2>&1 &"'.format(pdsh_switches)
     result = subprocess.run(cmd, shell=True, universal_newlines=True,
