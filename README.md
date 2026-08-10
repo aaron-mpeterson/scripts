@@ -8,4 +8,4 @@ Brief description of each:
 3. dgrloopbackWC - just an edited version of 'dgrloopback' (written for Colorados) to work with Wildcats. Tweaked the args code and the command used in subprocess.run() to match Wildcat usage
 4. port_temps.sh - one line script to display temps for front ports of all switches installed in rack. Rarely used.
 5. sbcheck.sh - simple script to check if switches have secure boot enabled and handle updating the uboot and pC image only if they don't. Saves user from many headaches.
-6. switch-ui.py - just a fun project to create a TUI displaying info about switches installed in the rack using Python's curses library. Currently only displays info about software versions.
+6. switch-ui.py - TUI displaying info about switches installed in the rack using Python's curses library. Does not affect state. Currently displays software version info, voltages/temps, and board info (SN, PN, etc.)
