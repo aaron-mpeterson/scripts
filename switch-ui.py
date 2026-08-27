@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 
-# A fun project I work on when work is slow!
-# Ideas:
-#   Add tabs (summary, one for each switch showing more info)
-#   Add command line functionality to pass commands to switches (all or individual)
-
 import curses
 import subprocess
 import threading
 import time 
 import re
+import sys
 
+keep_running = True
 data_lock = threading.Lock()
-keep_running = True 
 
-# #Hardcoded list of switch locations if needed
-# switch_locations = ('x9000c1r0b0', 'x9000c1r1b0', 'x9000c1r2b0','x9000c1r3b0',
-#                     'x9000c1r4b0','x9000c1r5b0','x9000c1r6b0', 'x9000c1r7b0',
-#                     'x9000c3r0b0', 'x9000c3r1b0', 'x9000c3r2b0', 'x9000c3r3b0')
-
+################################
+###---GET SWITCH LOCATIONS---###
+################################
 def get_switch_locations():
     try:
         cmd = ["cnodes", "--switch-controller"]
@@ -33,8 +27,21 @@ def get_switch_locations():
         pass
 switch_locations = get_switch_locations()
 
+switch_locations_hardcoded = ('x9000c1r0b0', 'x9000c1r1b0', 'x9000c1r2b0','x9000c1r3b0',
+                              'x9000c1r4b0','x9000c1r5b0','x9000c1r6b0', 'x9000c1r7b0',
+                              'x9000c3r0b0', 'x9000c3r1b0', 'x9000c3r2b0', 'x9000c3r3b0')
+if not switch_locations:
+    switch_locations = switch_locations_hardcoded
 
-# default values to display
+
+
+
+###############################
+###---INITIALIZE MESSAGES---###
+###############################
+debug_log_output = 'Waiting for output from command...'
+dgrpower_data = "Waiting for data..."
+eeprom_data = "Waiting for data..."
 version_data = {
     sw: {
         'Firmware version': 'Loading...',
@@ -46,8 +53,13 @@ version_data = {
 }
 
 
+
+
+#############################
+###---COMMAND FUNCTIONS---###
+#############################
 def clean_up_string(string):
-    clean_string = string.replace("OK Enabled", "").replace("OK Updating", "").strip()
+    clean_string = string.replace("OK Enabled", "").strip()
 
     match = re.compile(r"^([a-zA-Z0-9\.]+-[0-9]+)").match(clean_string)
     if match:
@@ -56,8 +68,21 @@ def clean_up_string(string):
     return clean_string
 
 
-def parse_cfirmware_output():
-    # Default values
+def command_runner(cmd):
+    result = subprocess.run(cmd, shell=True,
+                            executable="/bin/bash",
+                            universal_newlines=True,
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE,
+                            timeout=8)
+    return result.stdout
+    
+
+
+def get_cfirmware_output():
+    global debug_log_output
+
+    #fallback data 
     parsed_data = {
         sw: {
             'Firmware version': 'Unknown',
@@ -66,16 +91,13 @@ def parse_cfirmware_output():
             'Status': 'Offline'
         } for sw in switch_locations
     }
-
     try:
         current_switch = None
-        cmd = ["cfirmware", "sc", "checkall", "x9000c*"]
-        result = subprocess.run(cmd, universal_newlines=True,
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE,
-                                timeout=15)
+        cmd = 'cfirmware sc checkall x9000c*'
+        result = command_runner(cmd)
+        #debug_log_output = result.stdout
 
-        for line in result.stdout.splitlines():
+        for line in result.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -84,16 +106,22 @@ def parse_cfirmware_output():
                 location = line.split(":")[0].strip()
                 if location in parsed_data:
                     current_switch = location
+                    if "ClientConnectorError" in line:
+                        parsed_data[current_switch]['Status'] = 'Offline'
+                        continue
                     parsed_data[current_switch]['Status'] = 'Online'
 
             if current_switch:
                 if "BMC" in line:
                     if "Absent" in line:
                         parsed_data[current_switch]['Firmware version'] = 'Absent'
-                    else:
-                        version_number = line.split()[-1]
-                        cleaned = clean_up_string(version_number)
-                        parsed_data[current_switch]['Firmware version'] = cleaned if cleaned else version_number
+                        continue
+                    if "Updating" in line:
+                        parsed_data[current_switch]['Firmware version'] = 'Updating'
+                        continue
+                    version_number = line.split()[-1]
+                    cleaned = clean_up_string(version_number)
+                    parsed_data[current_switch]['Firmware version'] = cleaned if cleaned else version_number
 
                 elif "Bootloader" in line:
                     if "secure" in line:
@@ -107,95 +135,122 @@ def parse_cfirmware_output():
                     version_number = line.split()[-1].strip()
                     cleaned = clean_up_string(version_number)
                     parsed_data[current_switch]['Recovery image'] = cleaned if cleaned else version_number
-
+    
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
+        return "ERROR"
 
     return parsed_data
 
 
+def get_dgrpower_output():
+    global debug_log_output
+    try:
+        cmd = 'clush -w $(cnodes --switch-controller|nodeset -f) dgrpower'
+        result = command_runner(cmd)
+        #debug_log_output = result.stdout
 
-def multi_command_worker():
-    global version_data, keep_running
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "ERROR"
+    return result
 
+
+def get_eeprom_output():
+    global debug_log_output
+    try:
+        cmd = 'clush -w $(cnodes --platform-controller|nodeset -f) "hexdump -C /sys/class/i2c-adapter/i2c-6/6-0056/eeprom"; clush -w $(cnodes --switch-controller|nodeset -f) "hexdump -C /sys/class/i2c-adapter/i2c-0/0-0056/eeprom" ' 
+        result = command_runner(cmd)
+        #debug_log_output = result.stderr
+    
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return "ERROR"
+    return result
+
+
+def command_worker():
+    global version_data, dgrpower_data, eeprom_data, keep_running
+    
     while keep_running:
-        cfirmware_data = parse_cfirmware_output()
+        cfirmware_data = get_cfirmware_output()
+        dgrpower_data = get_dgrpower_output()
+        eeprom_data = get_eeprom_output()
 
-        with data_lock:
-            for sw in switch_locations:
-                version_data[sw] = cfirmware_data[sw]
-
-        # sleep for 5 seconds before checking again
-        for _ in range(50):
+        for sw in switch_locations:
+            version_data[sw] = cfirmware_data[sw]
+        
+        for _ in range(20):
             if not keep_running:
-                break
+                break 
             time.sleep(0.1)
 
 
 
-###########################################
-##           MAIN CURSES LOOP            ##
-###########################################
+################
+###---MAIN---###
+################
 
 def main(stdscr):
     global keep_running
 
-    # disable the cursor and set refresh rate  
-    curses.curs_set(0)
-    stdscr.timeout(100)
-
-    # start the thread to run commands
-    # This helps prevent flickering and weird issues with timing 
-    worker_thread = threading.Thread(target=multi_command_worker)
+    worker_thread = threading.Thread(target=command_worker)
     worker_thread.start()
 
-    # curses color pairs
+    #curses options
+    curses.curs_set(0)
+    stdscr.timeout(100)
     curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
 
     # initialize some useful things 
     height, width = stdscr.getmaxyx()
-    current_tab = 0
 
-    # Create sw_boxes outside the loop to prevent flickering
+    # debug window 
+    debug_win = curses.newwin(height -4, 120, 2, 2)
+
+
+    # #Create boxes for each switch
+    sw_boxes = {}
     box_height = 6
     box_width = 38
     start_y, start_x = 4, 2
     y_gap, x_gap = 1, 2
 
-    sw_boxes = {}
     for index, sw in enumerate(switch_locations):
-        # math to create a grid of boxes (no more than 4 rows)
         row_idx = index % 4
         col_idx = index // 4
-        
-        # center the columns (this is nauseating math but it works)
         total_cols = (len(switch_locations) + 3) // 4
-        total_grid_width = (total_cols * (box_width)) + ((total_cols - 1) * x_gap)
 
-        win_y = start_y + (row_idx * (box_height + y_gap))
+        total_grid_width = (total_cols * (box_width)) + ((total_cols - 1) * x_gap)
         left_edge = (width - total_grid_width) // 2
+        win_y = start_y + (row_idx * (box_height + y_gap))
         win_x = left_edge + (col_idx * (box_width + x_gap))
 
         sw_boxes[sw] = curses.newwin(box_height, box_width, win_y, win_x)
 
 
-    # Create tab windows outside of loop
+    #Create tabs for each switch 
+    sw_tabs = {}
+
     tab_win_height = height - 8
     tab_win_width = width - 8
     tab_start_y = 2 
     tab_start_x = 4 
-    
-    tab_window = curses.newwin(tab_win_height, tab_win_width, tab_start_y, tab_start_x)
+
+    current_tab = 0
+    for index, sw in enumerate(switch_locations):
+        sw_tabs[sw] = curses.newwin(tab_win_height, tab_win_width, tab_start_y, tab_start_x)
 
     
-    while True:
-        stdscr.erase()  # changed to .erase() because .clear() was giving me seizures
 
-        # Copy the latest data to use inside the loop without causing slowdown
+
+    while keep_running:
+        stdscr.erase()
+
+        # Copy the latest data
         with data_lock:
             latest_version_data = version_data.copy()
-        
-        height, width = stdscr.getmaxyx()
+            latest_power_data = dgrpower_data
+            latest_eeprom_data = eeprom_data
+            latest_debug_log = debug_log_output
+
 
         title = "=== SWITCH DASHBOARD ==="
         stdscr.addstr(0, max(2, (width - len(title)) // 2), title, curses.A_BOLD)
@@ -204,34 +259,15 @@ def main(stdscr):
         stdscr.addstr(height - 2, 2, keybind_bar)
         stdscr.chgat(height -2, 0, -1, curses.A_REVERSE)
 
-        
-        # add tabs at the top
-        max_tabs = len(switch_locations)
-        tabs = ["SUMMARY"]
-
-        for location in switch_locations[:12]:
-            tabs.append(location)
-
+        max_tabs = len(switch_locations)  # this math works because of the 'SUMMARY' tab, remember to adjust if changing that
+        tab_list = ["SUMMARY"]
         tabs_offset = 2 
 
-        for tab_num, tab_name in enumerate(tabs):
-            if tab_num == current_tab:
-                stdscr.attron(curses.A_REVERSE)
-            if tab_num != current_tab:
-                stdscr.attron(curses.A_DIM)
-
-            stdscr.addstr(1, tabs_offset, f" {tab_name} ")
-            stdscr.attroff(curses.A_REVERSE)
-            stdscr.attroff(curses.A_DIM)
-
-            # for debugging 
-            stdscr.addstr(height - 3, 1, f"Current tab is: {current_tab}, Max tab is {max_tabs}")
-
-            # space the tabs
-            tabs_offset += len(tab_name) + 2
 
         # stops the screen from updating until told to with .doupdate(), prevents flickering
         stdscr.noutrefresh()
+        
+
 
         for sw, win in sw_boxes.items():
             displayed_data = latest_version_data[sw]
@@ -250,17 +286,66 @@ def main(stdscr):
 
             win.noutrefresh()
 
-        
-        # tabs for each switch location
-        if current_tab >> 0:
-            tab_window.erase()
-            tab_window.box()
-            tab_window.addstr(2, 2, "This is a tab window")
-            tab_window.addstr(3, 2, f"This tab belongs to {tabs[current_tab]}")
-            tab_window.noutrefresh()
+
+
+        for location in switch_locations[:12]:
+            tab_list.append(location)
+
+
+        for sw, tab_window in sw_tabs.items():
+            pc = sw.replace("b","m")
+
+            if current_tab >> 0 and sw == tab_list[current_tab]:
+                tab_window.erase()
+                tab_window.box()
+
+                tab_window.addstr(2, 3, f"Waiting for data to load...")
+                dgrpower_y = 2
+                
+                for i, line in enumerate(latest_power_data.split("\n")):
+                    if sw in line:
+                        data = line.split(":",1)[1]
+                        tab_window.addstr(dgrpower_y, 2, data[:66])
+                        dgrpower_y += 1
+                
+                eeprom_y = 2
+                for i, line in enumerate(latest_eeprom_data.split("\n")):
+                    if pc in line:
+                        data = line.split(":",1)[1]
+                        tab_window.addstr(eeprom_y,  78, data[61:])
+                        eeprom_y += 1
+                    if sw in line:
+                        data = line.split(":",1)[1]
+                        tab_window.addstr(eeprom_y,  78, data[61:])
+                        eeprom_y += 1
+                tab_window.noutrefresh()
+
+
+        for tab_num, tab_name in enumerate(tab_list):
+            if tab_num == current_tab:
+                stdscr.attron(curses.A_REVERSE)
+            if tab_num != current_tab:
+                stdscr.attron(curses.A_DIM)
+
+            stdscr.addstr(1, tabs_offset, f" {tab_name} ")
+            stdscr.attroff(curses.A_REVERSE)
+            stdscr.attroff(curses.A_DIM)
+            tabs_offset += len(tab_name) + 2
+            
+
+
+        # debug_win.erase()
+        # debug_win.box()
+        # debug_win.addstr(1, 2, "DEBUG OUTPUT LOG:", curses.A_UNDERLINE)
+        #
+        # for i, line in enumerate(latest_debug_log.split("\n")):
+        #
+        #     debug_win.addstr(2 + i, 2, line)
+        # debug_win.noutrefresh()
 
 
         # refresh the whole screen 
+        # time.sleep(0.03)
         curses.doupdate()
 
         key = stdscr.getch()
@@ -272,13 +357,13 @@ def main(stdscr):
             current_tab += -1
             if current_tab == -1:
                 current_tab = max_tabs
-        if key == ord('u'):
-            break
         if key == ord('q'):
-            break
+            keep_running = False
+            worker_thread.join()
+            sys.exit(0)
 
         # refresh the whole screen 
-        curses.doupdate()
+        # curses.doupdate()
 
     keep_running = False
     worker_thread.join()
